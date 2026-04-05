@@ -13,8 +13,8 @@ authors = [
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
 dependencies = [
-    "numpy",
-    "torch>=2.1,<2.3",
+    "numpy<2",
+    "torch>=2.4,<2.5",
     "omegaconf",
     "rich",
     "boto3",

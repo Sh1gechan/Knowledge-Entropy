@@ -1,31 +1,68 @@
 #!/bin/bash
+#
+# Download OLMo-1B checkpoint from HuggingFace.
+#
+# Usage:
+#   bash scripts/get_model.sh <step_number>
+#   bash scripts/get_model.sh 738020
+#
+# The checkpoint is saved to:
+#   checkpoints/pretrained_1B/<step_number>-unsharded/model.safetensors
+#
+# olmo/checkpoint.py automatically falls back to .safetensors when .pt is not found,
+# so model.safetensors is sufficient — config.yaml and train.pt are not needed
+# because the training config is provided via configs/ and optimizer state is reset
+# (reset_optimizer_state: true in the yaml).
 
-# Assign the single path to a variable
-CKPT_PATH="$1"
-echo "Processing checkpoint path: $CKPT_PATH"
+STEP="${1:-738020}"
+REPO="allenai/OLMo-1B"
 
 SCRIPT_DIR=$(dirname "$(realpath "$BASH_SOURCE")")
 ROOT_DIR=$(realpath "$SCRIPT_DIR/..")
-echo "Root dir is $ROOT_DIR"
+echo "Root dir: $ROOT_DIR"
 
-# Extract the number after "step"
-step_number=$(echo "$CKPT_PATH" | sed -n 's/.*step\([0-9]*\)-unsharded\/.*/\1/p')
-echo "Extracted step number: $step_number"
+# Resolve HuggingFace revision (branch) for the given step
+REVISION=$(python3 -c "
+from huggingface_hub import list_repo_refs
+refs = list_repo_refs('${REPO}')
+for b in refs.branches:
+    if b.name.startswith('step${STEP}-'):
+        print(b.name)
+        break
+" 2>/dev/null)
 
-OUTPUT_PATH="checkpoints/pretrained_1B/$step_number-unsharded"
+if [ -z "$REVISION" ]; then
+    echo "ERROR: Could not find a HuggingFace branch for step ${STEP} in ${REPO}."
+    echo "Available step branches:"
+    python3 -c "
+from huggingface_hub import list_repo_refs
+refs = list_repo_refs('${REPO}')
+for b in refs.branches:
+    if b.name.startswith('step'):
+        print(' ', b.name)
+" 2>/dev/null
+    exit 1
+fi
 
-# Create the output directory if it doesn't exist
+echo "Resolved revision: ${REVISION}"
+
+OUTPUT_PATH="${ROOT_DIR}/checkpoints/pretrained_1B/${STEP}-unsharded"
 mkdir -p "$OUTPUT_PATH"
-# mkdir -p "$OUTPUT_PATH/hf"
 
-# Change to the output directory
-cd "$OUTPUT_PATH"
+OUTPUT_FILE="${OUTPUT_PATH}/model.safetensors"
+if [ -f "$OUTPUT_FILE" ]; then
+    echo "File already exists: ${OUTPUT_FILE}. Skipping download."
+    exit 0
+fi
 
-# Download the config.yaml file
-wget "${CKPT_PATH}config.yaml"
-wget "${CKPT_PATH}model.pt"
-wget "${CKPT_PATH}train.pt"
-
-cd "$ROOT_DIR"
-
-# python scripts/convert_olmo_to_hf_new.py --input_dir "${OUTPUT_PATH}" --output_dir "${OUTPUT_PATH}/hf" --tokenizer_json_path tokenizers/allenai_gpt-neox-olmo-dolma-v1_5.json
+echo "Downloading model.safetensors -> ${OUTPUT_FILE}"
+python3 -c "
+from huggingface_hub import hf_hub_download
+path = hf_hub_download(
+    repo_id='${REPO}',
+    filename='model.safetensors',
+    revision='${REVISION}',
+    local_dir='${OUTPUT_PATH}',
+)
+print('Saved to:', path)
+"

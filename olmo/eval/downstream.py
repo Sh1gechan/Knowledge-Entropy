@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 class ICLMetric(Metric):
     # update method does not require access to global metric state
-    full_state_update: bool = False
+    full_state_update: Optional[bool] = False
 
     def __init__(self, metric_type="acc") -> None:
         """metric_type: f1, acc, len_norm, pmi_dc"""
@@ -176,14 +176,10 @@ class ICLMultiChoiceTaskDataset(metaclass=abc.ABCMeta):
 
         dataset_list = []
         for ds_name in dataset_names:
-            dataset_list.append(
-                datasets.load_dataset(
-                    path=self.dataset_path,
-                    name=ds_name,
-                    split=split,
-                    trust_remote_code=True,
-                )
-            )
+            load_kwargs: Dict[str, Any] = {"path": self.dataset_path, "split": split}
+            if ds_name is not None:
+                load_kwargs["name"] = ds_name
+            dataset_list.append(datasets.load_dataset(**load_kwargs))
         self.dataset = datasets.concatenate_datasets(dataset_list)
 
         # prep examples
@@ -212,8 +208,11 @@ class ICLMultiChoiceTaskDataset(metaclass=abc.ABCMeta):
                 continuations = self.doc_to_continuations(doc)
                 label_id = self.doc_to_label(doc)
                 doc_text = self.doc_to_text(doc)
+                assert isinstance(doc_text, str)
+                dc_text = self.doc_to_domain_conditional(doc)
+                assert isinstance(dc_text, str)
                 ctx = self.token_encode(doc_text)
-                dc = self.token_encode(self.doc_to_domain_conditional(doc))
+                dc = self.token_encode(dc_text)
                 if self.log_instances > 0:
                     self.log_instances -= 1
                     ds_name = self.dataset_name
@@ -354,9 +353,9 @@ class ICLMultiChoiceTaskDataset(metaclass=abc.ABCMeta):
         return self.tokenizer.decode(tokens)
 
     @abc.abstractmethod
-    def doc_to_text(self, doc) -> str:
+    def doc_to_text(self, doc) -> Union[str, List[str]]:
         """Match EAI eval harness
-        returns a single context string
+        returns a single context string, or a list of context strings for special cases (e.g. WinoGrande)
         """
         raise NotImplementedError
 
@@ -374,7 +373,7 @@ class ICLMultiChoiceTaskDataset(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
-    def doc_to_domain_conditional(self, doc) -> str:
+    def doc_to_domain_conditional(self, doc) -> Union[str, List[str]]:
         """Provide string for domain conditional normalization
         by default its blank string, continuation normalized by prob conditioned on a blank
         """
@@ -398,12 +397,25 @@ class PIQA(ICLMultiChoiceTaskDataset):
 
     metric_type = "len_norm"
 
-    def __init__(self, tokenizer, dataset_path="piqa", dataset_name=None):
-        super().__init__(
-            tokenizer=tokenizer,
-            dataset_path=dataset_path,
-            dataset_name=dataset_name,
-        )
+    def __init__(self, tokenizer, dataset_path="ybisk/piqa", dataset_name=None):
+        # ybisk/piqa uses a legacy loading script; use the auto-converted Parquet branch
+        import datasets as _datasets
+        import functools
+        _orig_load = _datasets.load_dataset
+        def _patched_load(*args, **kwargs):
+            if kwargs.get("path", args[0] if args else None) in ("piqa", "ybisk/piqa"):
+                kwargs["revision"] = "refs/convert/parquet"
+                kwargs.pop("trust_remote_code", None)
+            return _orig_load(*args, **kwargs)
+        _datasets.load_dataset = _patched_load
+        try:
+            super().__init__(
+                tokenizer=tokenizer,
+                dataset_path=dataset_path,
+                dataset_name=dataset_name,
+            )
+        finally:
+            _datasets.load_dataset = _orig_load
 
     def doc_to_text(self, doc):
         return "Question: " + doc["goal"] + "\nAnswer:"
@@ -550,7 +562,7 @@ class WinoGrande(ICLMultiChoiceTaskDataset):
 
             doc_id += 1
 
-    def doc_to_text(self, doc):
+    def doc_to_text(self, doc) -> List[str]:
         # special case where there are multiple ctx and single continuation
         pronoun_loc = doc["sentence"].index("_")
 
@@ -568,7 +580,7 @@ class WinoGrande(ICLMultiChoiceTaskDataset):
     def doc_to_label(self, doc):
         return int(doc["answer"]) - 1
 
-    def doc_to_domain_conditional(self, doc):
+    def doc_to_domain_conditional(self, doc) -> List[str]:
         """same number of domain conditionals as context"""
         return [doc["option1"], doc["option2"]]
 
@@ -711,7 +723,7 @@ class ArcEasy(ICLMultiChoiceTaskDataset):
 
     metric_type = "acc"
 
-    def __init__(self, tokenizer, dataset_path="ai2_arc", dataset_name="ARC-Easy"):
+    def __init__(self, tokenizer, dataset_path="ai2_arc", dataset_name: Optional[str] = "ARC-Easy"):
         super().__init__(
             tokenizer=tokenizer,
             dataset_path=dataset_path,
@@ -1191,7 +1203,7 @@ class MMLU(ICLMultiChoiceTaskDataset):
             # Need to grab the dev set for the few-shot prompts
             for name in dataset_names:
                 self.dev_set[name] = datasets.load_dataset(
-                    path=dataset_path, name=name, split="dev", trust_remote_code=True
+                    path=dataset_path, name=name, split="dev",
                 )
         super().__init__(
             tokenizer=tokenizer,

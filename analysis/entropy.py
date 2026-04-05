@@ -3,8 +3,7 @@ import torch
 import json
 from collections import defaultdict
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, OlmoForCausalLM
-from .modeling_olmo_hf import ExpOlmoForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -27,6 +26,16 @@ def main(args):
         
     dataloader, model, model_path = load_model(args)
     
+    # Register hooks to capture MLP intermediate activations (input to down_proj)
+    captured_activations = {}
+    hooks = []
+    for idx, layer in enumerate(model.model.layers):
+        def make_hook(layer_idx):
+            def hook_fn(module, input, output):
+                captured_activations[layer_idx] = input[0].detach()
+            return hook_fn
+        h = layer.mlp.down_proj.register_forward_hook(make_hook(idx))
+        hooks.append(h)
     
     batch_num = 0
     non_padding_count = 0 
@@ -43,7 +52,8 @@ def main(args):
             bs, seq_len, _ = logits.shape
             batch_num += bs
    
-            for layer_idx, activation in enumerate(outputs.activations):
+            for layer_idx in range(layer_num):
+                activation = captured_activations[layer_idx]
                 reshaped_activation_abs = torch.abs(activation).view(-1, mlp_dimension)
                 if 'attention_mask' in batch:
                     summed_activation = torch.sum(reshaped_activation_abs, dim=0)
@@ -53,9 +63,12 @@ def main(args):
                     summed_activation /= activation.shape[1]
                     avg_act_abs[layer_idx] += summed_activation
             
-            # Clear memory  
-            del input_ids, outputs, logits, reshaped_activation_abs, summed_activation
+            captured_activations.clear()
+            del input_ids, outputs, logits
             torch.cuda.empty_cache() 
+    
+    for h in hooks:
+        h.remove()
     
     length = non_padding_count if non_padding_count != 0 else batch_num    
     avg_act_abs /= length    
@@ -114,12 +127,12 @@ def load_model(args):
     subset_dataset = IndexedDataset(dataset, instances, tokenizer=tokenizer) 
     dataloader = DataLoader(subset_dataset, batch_size=args.batch_size, shuffle=False) 
     
-    model = ExpOlmoForCausalLM.from_pretrained(base_model, attn_implementation="eager") #, device_map="auto")  
-    model = convert_to_hf(model, load_path = model_path, model_size=model_size)
+    model = AutoModelForCausalLM.from_pretrained(base_model, attn_implementation="eager")
+    model = convert_to_hf(model, load_path=model_path, model_size=model_size)
         
     model.eval()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device=device)
     print("model_path is ", model_path)
     
     return dataloader, model, model_path
@@ -129,6 +142,7 @@ def convert_to_hf(model, load_path=None, ckpt_name=None, model_size="1B"):
     from olmo.config import TrainConfig
     from olmo.util import clean_opt
     
+    assert load_path is not None
     pt_name = "model.pt" if ckpt_name is None else f"{ckpt_name}.pt"
     ckpt = load_state_dict(
         load_path, pt_name, local_cache=None, map_location="cpu"

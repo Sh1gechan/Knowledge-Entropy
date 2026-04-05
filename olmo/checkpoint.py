@@ -1,6 +1,8 @@
+import binascii
 import gc
 import io
 import logging
+import os
 import pickle
 import shutil
 import traceback
@@ -13,7 +15,7 @@ from dataclasses import dataclass, field, replace
 from functools import reduce
 from multiprocessing import shared_memory
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union, cast
 
 import numpy as np
 import torch
@@ -270,10 +272,20 @@ def load_state_dict(
     *,
     local_cache: Optional[PathOrStr] = None,
     map_location: Optional[str] = None,
-):
+) -> Dict[str, Any]:
     """
     Load a regular state dict from the file ``fname`` within ``checkpoint_dir`` using :func:`torch.load()`.
     This can be used during distributed training or not.
+
+    When ``fname`` ends with ``.pt`` and a corresponding ``.safetensors`` file exists,
+    the safetensors file is loaded instead.  Two safetensors dialects are supported:
+
+    * OLMo's own format (keys are base64-encoded pickles) -- produced by
+      :func:`state_dict_to_safetensors_file`.
+    * Standard HuggingFace format (keys are plain parameter names, optionally
+      prefixed with ``model.``).  The ``model.`` prefix is stripped so that
+      downstream callers (e.g. ``_make_state_dict_compatible``) receive the
+      same key format as the OLMo variant.
 
     :param checkpoint_dir: A local or remote checkpoint directory.
     :param fname: The target file within the ``checkpoint_dir``. This should be a path relative to the ``checkpoint_dir``.
@@ -288,12 +300,19 @@ def load_state_dict(
             path = resource_path(
                 str(checkpoint_dir).rstrip("/"), fname[:-2] + "safetensors", local_cache=local_cache
             )
-            return safetensors_file_to_state_dict(path, map_location=map_location)
+            try:
+                return safetensors_file_to_state_dict(path, map_location=map_location)
+            except (binascii.Error, pickle.UnpicklingError):
+                import safetensors.torch as _st
+                map_loc = map_location or "cpu"
+                raw: Dict[str, Any] = _st.load_file(str(path), device=map_loc)
+                return {(k[len("model."):] if k.startswith("model.") else k): v for k, v in raw.items()}
         except FileNotFoundError:
             pass
 
     path = resource_path(str(checkpoint_dir).rstrip("/"), fname, local_cache=local_cache)
-    return torch.load(path, map_location=map_location)
+    result: Dict[str, Any] = torch.load(path, map_location=map_location)
+    return result
 
 
 def load_model_state(checkpoint_dir: PathOrStr, model: torch.nn.Module):
@@ -378,7 +397,7 @@ class RemoteFileSystemWriter(dist_cp.FileSystemWriter):
     def finish(self, metadata: Metadata, results: List[List[WriteResult]]) -> None:
         super().finish(metadata, results)
         if self.upload_to is not None:
-            source = self.path / ".metadata"
+            source = Path(self.path) / ".metadata"
             target = f"{self.upload_to}/.metadata"
             log.info(f"Uploading {source} to {target}...")
             upload(source, target, save_overwrite=self.save_overwrite)
@@ -458,9 +477,20 @@ class RemoteFileSystemReader(dist_cp.StorageReader):
 
     def read_metadata(self) -> Metadata:
         if self._metadata is None:
-            with resource_path(self.path, ".metadata", local_cache=self.cache).open("rb") as metadata_file:
+            with Path(resource_path(self.path, ".metadata", local_cache=self.cache)).open("rb") as metadata_file:
                 self._metadata = pickle.load(metadata_file)
-        return self._metadata
+        return cast(Metadata, self._metadata)
+
+    def reset(self, checkpoint_id: Optional[Union[str, os.PathLike]] = None) -> None:
+        self.storage_data = dict()
+        self._metadata = None
+        if checkpoint_id is not None:
+            self.path = str(checkpoint_id).rstrip("/")
+
+    @classmethod
+    def validate_checkpoint_id(cls, checkpoint_id: Union[str, os.PathLike]) -> bool:
+        p = str(checkpoint_id)
+        return p.startswith("s3://") or p.startswith("r2://") or os.path.isdir(p)
 
     def set_up_storage_reader(self, metadata: Metadata, is_coordinator: bool) -> None:
         del is_coordinator
@@ -470,8 +500,8 @@ class RemoteFileSystemReader(dist_cp.StorageReader):
     def prepare_local_plan(self, plan: dist_cp.LoadPlan) -> dist_cp.LoadPlan:
         return plan
 
-    def prepare_global_plan(self, global_plan: List[dist_cp.LoadPlan]) -> List[dist_cp.LoadPlan]:
-        return global_plan
+    def prepare_global_plan(self, plans: List[dist_cp.LoadPlan]) -> List[dist_cp.LoadPlan]:
+        return plans
 
 
 class Checkpointer(metaclass=ABCMeta):
@@ -485,7 +515,7 @@ class Checkpointer(metaclass=ABCMeta):
         dir: PathOrStr,
         fsdp_model: FSDP,
         optim: Optimizer,
-        train_state: Dict[str, Any],
+        trainer_state: Dict[str, Any],
         *,
         upload_to: Optional[str] = None,
         skip_optim: Optional[bool] = False,
@@ -660,6 +690,7 @@ class FullCheckpointer(Checkpointer):
         *,
         local_cache: Optional[PathOrStr] = None,
         load_optimizer_state: bool = True,
+        load_trainer_state: bool = True,
     ) -> Dict[str, Any]:
         with FSDP.state_dict_type(
             fsdp_model,
@@ -724,11 +755,17 @@ class FullCheckpointer(Checkpointer):
                 del optim_state_dict_to_load
 
             # Load other state.
-            try:
-                trainer_state = load_state_dict(load_path, "train.pt", local_cache=local_cache)
-            except FileNotFoundError:
-                # for backwards compatibility
-                trainer_state = load_state_dict(load_path, "other.pt", local_cache=local_cache)
+            if load_trainer_state:
+                try:
+                    trainer_state = load_state_dict(load_path, "train.pt", local_cache=local_cache)
+                except FileNotFoundError:
+                    try:
+                        # for backwards compatibility
+                        trainer_state = load_state_dict(load_path, "other.pt", local_cache=local_cache)
+                    except FileNotFoundError:
+                        trainer_state = {}
+            else:
+                trainer_state = {}
         barrier()
         return trainer_state
 
@@ -1280,15 +1317,19 @@ class LocalShardedCheckpointer(Checkpointer):
     def _fsdp_handles(self, fsdp_model: FSDP) -> List[FlatParamHandle]:
         if version.parse(torch.__version__) < version.parse("2.1.0"):
             return fsdp_model._handles  # type: ignore
-        elif version.parse(torch.__version__) < version.parse("2.3.0"):
-            # Handle could be None if the FSDP wrapper doesn't manage any parameters.
-            if hasattr(fsdp_model, "_handle") and fsdp_model._handle is not None:
-                return [fsdp_model._handle]  # type: ignore
-            else:
-                return []
-        else:
-            # Need to verify FSDP internals with newer versions.
-            raise NotImplementedError
+
+        # Later FSDP versions still keep one flat-parameter handle per wrapper,
+        # but wrappers that do not own parameters may legitimately have no handle.
+        if hasattr(fsdp_model, "_handle") and fsdp_model._handle is not None:
+            return [fsdp_model._handle]  # type: ignore
+
+        handle_map = getattr(fsdp_model, "_fully_sharded_module_to_handle", None)
+        if handle_map is not None:
+            handle = handle_map.get(fsdp_model)
+            if handle is not None:
+                return [handle]  # type: ignore
+
+        return []
 
     @torch.no_grad()
     def _get_flat_param_state_to_save(self, fsdp_model: FSDP) -> Dict[str, Any]:

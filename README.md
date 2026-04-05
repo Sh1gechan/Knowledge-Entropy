@@ -27,15 +27,16 @@ Knowledge injection code is based on the [factual-knowledge-acquisition](https:/
 
 ## Installation
 
-1. Create a conda environment with python>=3.9.
-```
-conda create -n knowledge-entropy python=3.11 -y
-conda activate knowledge-entropy
+1. Create a Python virtual environment (Python 3.11 recommended).
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
 2. Install packages.
-```
-pip install -e .
+```bash
+pip install -e ".[train]"
+pip install flash-attn==2.8.3 --no-build-isolation
 ```
 
 3. Download the intermediate OLMo checkpoint. 
@@ -43,7 +44,7 @@ Example of downloading from the official repository is presented in `scripts/get
 First you have to figure out the link to the proper checkpoint in the [official link](https://github.com/allenai/OLMo/blob/main/checkpoints/official/OLMo-1B.csv)
 Below is example command for downloading the model whose pretraining step is 738020.
 
-```
+```bash
 bash scripts/get_model.sh https://olmo-checkpoints.org/ai2-llm/olmo-small/oupb6jak/step738020-unsharded/
 ```
 
@@ -51,39 +52,52 @@ bash scripts/get_model.sh https://olmo-checkpoints.org/ai2-llm/olmo-small/oupb6j
 ## Knowledge Entropy
 1. Download official training order of Dolma from [official link](https://olmo-checkpoints.org/ai2-llm/olmo-small/46zc5fly/train_data/global_indices.npy)
 
-```
+```bash
 bash scripts/get_dataorder.sh
 ```
 
-2. Run Knowledge entropy calculation command, where step, data_size and batch size should be chosed appropriately.
-```
+2. Run Knowledge entropy calculation command, where step, data_size and batch size should be chosen appropriately.
+```bash
 python -m analysis.entropy --step 738020 --data_size 2048 --batch_size 4
 ```
 
 ## Training
 Train OLMo model with modified config.
-You can find exmaplary config at `configs/1B/1B_bs128_lr4e4_pubmed_1ep_738k.yaml`.
+You can find an exemplary config at `configs/1B/1B_bs128_lr4e4_pubmed_1ep_738k.yaml`.
 
-
+**On a SLURM cluster**, submit the job using:
+```bash
+sbatch scripts/train.sh configs/1B/1B_bs128_lr4e4_pubmed_1ep_738k.yaml
 ```
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port=29599 -m scripts.train configs/1B/1B_bs128_lr4e4_pubmed_1ep_738k.yaml 
+
+See `scripts/train.sh` for SLURM options (partition, number of GPUs, etc.) and adjust them to your environment before submitting.
+
+**Running directly** (without SLURM):
+```bash
+torchrun --nproc_per_node=NUM_GPUS --master_port=29599 -m scripts.train configs/1B/1B_bs128_lr4e4_pubmed_1ep_738k.yaml
 ```
 
 ## Resuscitation
-1. Save modified model chekpoint.
+1. Save modified model checkpoint.
 Run modifying and saving model checkpoint for resuscitation method.
-Below is examplary command for changing with resuscitation ratio of 50% and amplifying factor of 2. 
+Below is an exemplary command for changing with resuscitation ratio of 50% and amplifying factor of 2. 
 
-```
-python -m analysis.change_parameters --step 738020--resuscitation_ratio 0.5 --amplifying_factor 2
+```bash
+python -m analysis.change_parameters --step 738020 --resuscitation_ratio 0.5 --amplifying_factor 2
 ```
 
 2. Run training command with modified config. 
 The name of the newly saved model should be specified at model.resuscitation.
-You can find exmaplary config at `configs/resuscitation/1B_bs128_lr4e4_pubmed_1ep_738k_resuscitation.yaml`.
+You can find an exemplary config at `configs/resuscitation/1B_bs128_lr4e4_pubmed_1ep_738k_resuscitation.yaml`.
 
+**On a SLURM cluster**:
+```bash
+sbatch scripts/train.sh configs/resuscitation/1B_bs128_lr4e4_pubmed_1ep_738k_resuscitation.yaml
 ```
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port=29599 -m scripts.train configs/resuscitation/1B_bs128_lr4e4_pubmed_1ep_738k_resuscitation.yaml
+
+**Running directly**:
+```bash
+torchrun --nproc_per_node=NUM_GPUS --master_port=29599 -m scripts.train configs/resuscitation/1B_bs128_lr4e4_pubmed_1ep_738k_resuscitation.yaml
 ```
 
 

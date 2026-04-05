@@ -149,22 +149,30 @@ class Trainer:
 
     def __post_init__(self):
         if self.cfg.fused_loss:
+            import flash_attn
             from flash_attn.ops.triton.cross_entropy import (  # type: ignore
                 cross_entropy_loss,
             )
+            from packaging import version
 
             def fused_loss_fn(
                 logits, labels, ignore_index: int = -100, reduction: str = "mean", compute_z_loss: bool = False
             ):
+                # flash-attn renamed this kwarg in v2.5.8.
+                if version.parse(flash_attn.__version__) >= version.parse("2.5.8"):
+                    ignore_index_kwarg = {"ignore_index": ignore_index}
+                else:
+                    ignore_index_kwarg = {"ignored_index": ignore_index}
+
                 loss, z_loss = cross_entropy_loss(
                     logits,
                     labels,
                     label_smoothing=0.0,
                     logit_scale=1.0,
                     lse_square_scale=0.0,
-                    ignored_index=ignore_index,
                     inplace_backward=False,
                     process_group=None,
+                    **ignore_index_kwarg,
                 )
 
                 mask = labels != ignore_index
@@ -563,6 +571,7 @@ class Trainer:
             self.optim,
             local_cache=local_cache,
             load_optimizer_state=load_optimizer_state,
+            load_trainer_state=load_trainer_state,
         )
         if load_trainer_state:
             self.load_trainer_state_dict(trainer_state)

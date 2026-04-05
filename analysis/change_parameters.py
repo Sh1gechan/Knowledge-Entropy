@@ -8,8 +8,9 @@ def main(step, resuscitation_ratio, amplifying_factor):
     if not os.path.isfile(average_coef_path):
         print(f"Get average coefficients first, by running `python -m analysis.entropy --step {step} --data_size 2048 --batch_size 4`")
     print("-"*50)
-    average_activations = torch.load(average_coef_path)
-    olmo_model = torch.load(f"{olmo_model_path}/model.pt")
+    average_activations = torch.load(average_coef_path, map_location="cpu")
+    from olmo.checkpoint import load_state_dict
+    olmo_model = load_state_dict(olmo_model_path, "model.pt", map_location="cpu")
     print("Loaded average coefficients and olmo model.")
     print(f"Saving new model parameters with resusctation ratio {resuscitation_ratio}, amplifying factor {amplifying_factor}")
     # Identify positions of values below the threshold

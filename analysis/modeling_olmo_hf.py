@@ -65,10 +65,6 @@ _CONFIG_FOR_DOC = "OlmoConfig"
 
 @dataclass
 class ExpBaseModelOutputWithPast(BaseModelOutputWithPast):
-    last_hidden_state: torch.FloatTensor = None
-    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
     activations: Optional[Tuple[torch.FloatTensor]] = None
     gate_activations: Optional[Tuple[torch.FloatTensor]] = None
     all_self_attn_weights_raw: Optional[Tuple[torch.FloatTensor]] = None
@@ -76,8 +72,8 @@ class ExpBaseModelOutputWithPast(BaseModelOutputWithPast):
 @dataclass
 class ExpCausalLMOutputWithPast(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
-    logits: torch.FloatTensor = None
-    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    logits: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[Cache] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     activations: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
@@ -111,12 +107,12 @@ class OlmoLayerNorm(nn.Module):
         )
 
 
-ALL_LAYERNORM_LAYERS.append(OlmoLayerNorm)
+ALL_LAYERNORM_LAYERS.append(OlmoLayerNorm)  # type: ignore[arg-type]
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->Olmo
 class OlmoRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+    def __init__(self, dim, max_position_embeddings=2048, base: Union[int, float] = 10000, device=None, scaling_factor=1.0):
         super().__init__()
         self.scaling_factor = scaling_factor
         self.dim = dim
@@ -283,10 +279,10 @@ class OlmoAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_heads = config.num_key_value_heads or config.num_attention_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = getattr(config, "rope_theta", 10000.0)
         self.is_causal = True
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
@@ -303,15 +299,20 @@ class OlmoAttention(nn.Module):
 
     # Copied from transformers.models.llama.modeling_llama.LlamaAttention._init_rope with Llama->Olmo
     def _init_rope(self):
-        if self.config.rope_scaling is None:
+        rope_scaling = getattr(self.config, "rope_scaling", None)
+        if rope_scaling is not None:
+            scaling_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
+        else:
+            scaling_type = None
+
+        if rope_scaling is None or scaling_type in (None, "default"):
             self.rotary_emb = OlmoRotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings=self.max_position_embeddings,
                 base=self.rope_theta,
             )
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
+            scaling_factor = rope_scaling["factor"]
             if scaling_type == "linear":
                 self.rotary_emb = OlmoLinearScalingRotaryEmbedding(
                     self.head_dim,
@@ -340,7 +341,7 @@ class OlmoAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         temperature: float = 1.0, 
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache], None]:
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states) #bsz, q_len, num_heads*head_dim
@@ -361,6 +362,7 @@ class OlmoAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
+            assert self.layer_idx is not None
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
@@ -410,7 +412,7 @@ class OlmoDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = OLMO_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+        self.self_attn = OLMO_ATTENTION_CLASSES[config._attn_implementation or "eager"](config=config, layer_idx=layer_idx)
 
         self.mlp = OlmoMLP(config)
         self.input_layernorm = OlmoLayerNorm(config.hidden_size)
@@ -427,9 +429,9 @@ class OlmoDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         temperature: float = 1.0, 
-        mlp_temperature: torch.Tensor = None,
+        mlp_temperature: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> Tuple:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -664,7 +666,7 @@ class OlmoModel(OlmoPreTrainedModel):
     # Copied from transformers.models.llama.modeling_llama.LlamaModel.forward
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -675,7 +677,7 @@ class OlmoModel(OlmoPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         temperature: float = 1.0,
-        mlp_temperature: torch.Tensor = None,
+        mlp_temperature: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, ExpBaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -696,12 +698,15 @@ class OlmoModel(OlmoPreTrainedModel):
             use_cache = False
 
         if inputs_embeds is None:
+            assert input_ids is not None
             inputs_embeds = self.embed_tokens(input_ids)
+        assert inputs_embeds is not None
 
         past_seen_tokens = 0
         if use_cache:  # kept for BC (cache positions)
-            if not isinstance(past_key_values, StaticCache):
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+            if not isinstance(past_key_values, (StaticCache, DynamicCache)):
+                past_key_values = DynamicCache()  # type: ignore[assignment]
+            if isinstance(past_key_values, DynamicCache):
                 past_seen_tokens = past_key_values.get_seq_length()
 
         if cache_position is None:
@@ -709,12 +714,12 @@ class OlmoModel(OlmoPreTrainedModel):
                 raise ValueError("cache_position is a required argument when using StaticCache.")
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
+            )  # type: ignore[arg-type]
 
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            position_ids = cache_position.unsqueeze(0)  # type: ignore[arg-type]
 
-        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens)
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens)  # type: ignore[arg-type]
 
         # embed positions
         hidden_states = inputs_embeds
@@ -726,10 +731,13 @@ class OlmoModel(OlmoPreTrainedModel):
         all_gate_activations = ()
         all_self_attn_weights_raw = ()
         next_decoder_cache = None
-        mlp_temperature = mlp_temperature if mlp_temperature is not None else [None]*len(self.layers)
+        mlp_temps: List[Optional[torch.Tensor]] = (
+            [mlp_temperature[i] for i in range(len(self.layers))] if mlp_temperature is not None
+            else [None] * len(self.layers)
+        )
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                all_hidden_states += (hidden_states,)  # type: ignore[operator]
             # import pdb; pdb.set_trace()
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -742,7 +750,7 @@ class OlmoModel(OlmoPreTrainedModel):
                     use_cache,
                     cache_position,
                     temperature,
-                    mlp_temperature[idx],
+                    mlp_temps[idx],
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -754,7 +762,7 @@ class OlmoModel(OlmoPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     temperature = temperature,
-                    mlp_temperature=mlp_temperature[idx],
+                    mlp_temperature=mlp_temps[idx],
                 )
 
             hidden_states = layer_outputs[0]
@@ -763,7 +771,7 @@ class OlmoModel(OlmoPreTrainedModel):
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                all_self_attns += (layer_outputs[1],)  # type: ignore[operator]
                 
             all_self_attn_weights_raw += (layer_outputs[-3],)
             all_activations += (layer_outputs[-2],)
@@ -773,13 +781,11 @@ class OlmoModel(OlmoPreTrainedModel):
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+            all_hidden_states += (hidden_states,)  # type: ignore[operator]
 
         next_cache = None
         if use_cache:
-            next_cache = (
-                next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
-            )
+            next_cache = next_decoder_cache
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return ExpBaseModelOutputWithPast(
@@ -787,9 +793,9 @@ class OlmoModel(OlmoPreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            activations=all_activations,
-            gate_activations=all_gate_activations,
-            all_self_attn_weights_raw=all_self_attn_weights_raw,
+            activations=all_activations,  # type: ignore[arg-type]
+            gate_activations=all_gate_activations,  # type: ignore[arg-type]
+            all_self_attn_weights_raw=all_self_attn_weights_raw,  # type: ignore[arg-type]
         )
 
     # Copied from transformers.models.llama.modeling_llama.LlamaModel._update_causal_mask
@@ -865,14 +871,14 @@ class OlmoModel(OlmoPreTrainedModel):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
             # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
             # Details: https://github.com/pytorch/pytorch/issues/110213
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)  # type: ignore[attr-defined]
 
         return causal_mask
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM with LLAMA->OLMO,Llama->Olmo
 class ExpOlmoForCausalLM(OlmoPreTrainedModel):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config):
         super().__init__(config)
@@ -906,7 +912,7 @@ class ExpOlmoForCausalLM(OlmoPreTrainedModel):
     # Ignore copy
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -918,7 +924,7 @@ class ExpOlmoForCausalLM(OlmoPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         temperature: float = 1.0, 
-        mlp_temperature: torch.Tensor = None,
+        mlp_temperature: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, ExpCausalLMOutputWithPast]:
         r"""
         Args:
@@ -1016,14 +1022,14 @@ class ExpOlmoForCausalLM(OlmoPreTrainedModel):
             if isinstance(past_key_values, Cache):
                 past_length = cache_position[0] if cache_position is not None else past_key_values.get_seq_length()
                 max_cache_length = (
-                    torch.tensor(past_key_values.get_max_length(), device=input_ids.device)
-                    if past_key_values.get_max_length() is not None
+                    torch.tensor(past_key_values.get_max_length(), device=input_ids.device)  # type: ignore[arg-type]
+                    if past_key_values.get_max_length() is not None  # type: ignore[attr-defined]
                     else None
                 )
                 cache_length = past_length if max_cache_length is None else torch.min(max_cache_length, past_length)
             # TODO joao: remove this `else` after `generate` prioritizes `Cache` objects
             else:
-                cache_length = past_length = past_key_values[0][0].shape[2]
+                cache_length = past_length = past_key_values[0][0].shape[2]  # type: ignore[index]
                 max_cache_length = None
 
             # Keep only the unprocessed tokens:
