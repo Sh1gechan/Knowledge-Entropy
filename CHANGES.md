@@ -165,14 +165,14 @@ Dolma v1.6-sample から最初の 2048 ドキュメントを取得し、`data/do
 2. **`_tied_weights_keys` の型変更** — transformers v5 で `list` → `dict` に変更され `AttributeError`（`{"lm_head.weight": "model.embed_tokens.weight"}` に修正）
 3. **`DynamicCache.from_legacy_cache()` の削除** — transformers v5 でメソッドが廃止され `AttributeError`（`DynamicCache()` に修正）
 4. **`DynamicCache.to_legacy_cache()` の削除** — 同上（キャッシュをそのまま返すように修正）
-5. **`rope_scaling` 辞書形式の相違** — OLMo config の `{"rope_theta": ..., "rope_type": "default"}` は LLaMA 形式の `{"type": ..., "factor": ...}` と異なり `KeyError`（`rope_type: "default"` をハンドリングするよう修正）
+5. **`rope_scaling` 辞書形式の不一致** — `_init_rope()` が LLaMA の `{"type": ..., "factor": ...}` 形式を前提としているが、OLMo-1B-hf の config は `{"rope_theta": ..., "rope_type": "default"}` 形式で `KeyError`（`rope_type: "default"` をハンドリングするよう修正）
 6. **レイヤー 1 以降で `nan` が伝播** — 上記修正をすべて適用してもカスタム attention 実装に起因する数値不安定が残り、MLP activations が `nan` になる問題が解消されなかった
 
-これらの問題を個別にパッチするのではなく、根本的に標準 `OlmoForCausalLM`（transformers 組み込み実装で `nan` なし）に切り替え、MLP 中間活性は `down_proj` の入力をフックで捕捉する方式とした。フックで取得される tensor は `act_fn(gate_proj(x)) * up_proj(x)` に相当し、元の `ExpOlmoForCausalLM` の `activations` と同一の値。
+根本原因は `modeling_olmo_hf.py` が LLaMA の実装をコピーして `Llama` → `Olmo` にリネームした構成であり、OLMo 固有の config 形式や transformers v5 の内部 API 変更に追従できていない点にある。個別パッチではなく、標準 `OlmoForCausalLM`（transformers 組み込み実装で `nan` なし）に切り替え、MLP 中間活性は `down_proj` の入力をフックで捕捉する方式とした。フックで取得される tensor は `act_fn(gate_proj(x)) * up_proj(x)` に相当し、元の `ExpOlmoForCausalLM` の `activations` と同一の値。
 
 ### 9.2 `analysis/modeling_olmo_hf.py` — 互換性修正（参考）
 
-`entropy.py` では使用しなくなったが、他の用途に備えて以下の互換性修正を適用済み：
+`entropy.py` では使用しなくなったが、他の用途に備えて以下の互換性修正を適用済み（ただし LLaMA コピー由来の構造的問題は残る）：
 
 | 行 | 修正内容 |
 |---|---|
